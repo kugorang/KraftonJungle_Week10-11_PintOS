@@ -11,6 +11,7 @@
 #include "threads/synch.h"
 #include "threads/vaddr.h"
 #include "intrinsic.h"
+#include <list.h>
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -27,6 +28,8 @@
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
 static struct list ready_list;
+
+static struct list sleep_list;
 
 /* Idle thread. */
 static struct thread *idle_thread;
@@ -105,9 +108,10 @@ thread_init (void) {
 	};
 	lgdt (&gdt_ds);
 
-	/* Init the globla thread context */
+	/* Init the global thread context */
 	lock_init (&tid_lock);
 	list_init (&ready_list);
+	list_init (&sleep_list);
 	list_init (&destruction_req);
 
 	/* Set up a thread structure for the running thread. */
@@ -232,6 +236,18 @@ thread_block (void) {
    be important: if the caller had disabled interrupts itself,
    it may expect that it can atomically unblock a thread and
    update other data. */
+
+/* Returns true if value A is more or equal than value B, 
+   false otherwise. */
+static bool
+thread_priority_more_and_equal (const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) 
+{
+  const struct thread *a = list_entry (a_, struct thread, elem);
+  const struct thread *b = list_entry (b_, struct thread, elem);
+  
+  return a->priority >= b->priority;
+}
+
 void
 thread_unblock (struct thread *t) {
 	enum intr_level old_level;
@@ -240,7 +256,7 @@ thread_unblock (struct thread *t) {
 
 	old_level = intr_disable ();
 	ASSERT (t->status == THREAD_BLOCKED);
-	list_push_back (&ready_list, &t->elem);
+	list_insert_ordered(&ready_list, &t->elem, thread_priority_more_and_equal, NULL);
 	t->status = THREAD_READY;
 	intr_set_level (old_level);
 }
@@ -303,8 +319,70 @@ thread_yield (void) {
 
 	old_level = intr_disable ();
 	if (curr != idle_thread)
-		list_push_back (&ready_list, &curr->elem);
+		list_insert_ordered (&ready_list, &curr->elem, thread_priority_more_and_equal, NULL);
 	do_schedule (THREAD_READY);
+	intr_set_level (old_level);
+}
+
+/* Returns true if value A is less than value B, false
+   otherwise. */
+static bool
+thread_tick_less (const struct list_elem *a_, const struct list_elem *b_,
+            void *aux UNUSED) 
+{
+  const struct thread *a = list_entry (a_, struct thread, elem);
+  const struct thread *b = list_entry (b_, struct thread, elem);
+  
+  return b->sleep_ticks > a->sleep_ticks;
+}
+
+void thread_sleep (int start)
+{
+	enum intr_level old_level;
+	struct thread *curr;
+
+	ASSERT (!intr_context ());
+
+	old_level = intr_disable ();
+	curr = thread_current ();
+
+	if (curr != idle_thread)
+	{
+		curr->sleep_ticks = start;
+		list_insert_ordered (&sleep_list, &curr->elem, thread_tick_less, NULL);
+
+		thread_block();
+	}
+
+	intr_set_level (old_level);
+}
+
+void thread_wakeup (void)
+{
+	enum intr_level old_level;
+	struct list_elem *e;
+	struct int64_t *curr_sleep_ticks;
+	
+	old_level = intr_disable ();
+	curr_sleep_ticks = timer_elapsed(thread_current()->sleep_ticks);
+
+	for (e = list_begin (&sleep_list); e != list_end (&sleep_list);)
+	{
+		struct thread *iter;
+		
+		iter = list_entry (e, struct thread, elem);
+
+		if (timer_elapsed(iter->sleep_ticks) > curr_sleep_ticks)
+		{
+			break;
+		}
+		
+		ASSERT (iter->status == THREAD_BLOCKED);
+		
+		e = list_remove (e);
+		thread_unblock (iter);
+	}
+	
 	intr_set_level (old_level);
 }
 
@@ -539,7 +617,7 @@ do_schedule(int status) {
 }
 
 static void
-schedule (void) {
+ schedule (void) {
 	struct thread *curr = running_thread ();
 	struct thread *next = next_thread_to_run ();
 
