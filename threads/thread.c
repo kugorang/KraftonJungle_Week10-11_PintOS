@@ -211,6 +211,13 @@ thread_create (const char *name, int priority,
 	/* Add to run queue. */
 	thread_unblock (t);
 
+	// 새로 만든 스레드가 현재 스레드보다 우선순위가 높은지 확인한다.
+	if (t->priority > thread_current ()->priority)
+	{
+		// 높다면 현재 스레드를 양보하여 새 스레드가 실행되게 한다.
+		thread_yield ();
+	}
+
 	return tid;
 }
 
@@ -236,18 +243,6 @@ thread_block (void) {
    be important: if the caller had disabled interrupts itself,
    it may expect that it can atomically unblock a thread and
    update other data. */
-
-/* Returns true if value A is more or equal than value B, 
-   false otherwise. */
-static bool
-thread_priority_more_and_equal (const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) 
-{
-  const struct thread *a = list_entry (a_, struct thread, elem);
-  const struct thread *b = list_entry (b_, struct thread, elem);
-  
-  return a->priority >= b->priority;
-}
-
 void
 thread_unblock (struct thread *t) {
 	enum intr_level old_level;
@@ -256,7 +251,7 @@ thread_unblock (struct thread *t) {
 
 	old_level = intr_disable ();
 	ASSERT (t->status == THREAD_BLOCKED);
-	list_insert_ordered(&ready_list, &t->elem, thread_priority_more_and_equal, NULL);
+	list_insert_ordered(&ready_list, &t->elem, thread_compare_priority_greater, NULL);
 	t->status = THREAD_READY;
 	intr_set_level (old_level);
 }
@@ -319,7 +314,7 @@ thread_yield (void) {
 
 	old_level = intr_disable ();
 	if (curr != idle_thread)
-		list_insert_ordered (&ready_list, &curr->elem, thread_priority_more_and_equal, NULL);
+		list_insert_ordered (&ready_list, &curr->elem, thread_compare_priority_greater, NULL);
 	do_schedule (THREAD_READY);
 	intr_set_level (old_level);
 }
@@ -336,60 +331,26 @@ thread_tick_less (const struct list_elem *a_, const struct list_elem *b_,
   return b->sleep_ticks > a->sleep_ticks;
 }
 
-void thread_sleep (int start)
-{
-	enum intr_level old_level;
-	struct thread *curr;
-
-	ASSERT (!intr_context ());
-
-	old_level = intr_disable ();
-	curr = thread_current ();
-
-	if (curr != idle_thread)
-	{
-		curr->sleep_ticks = start;
-		list_insert_ordered (&sleep_list, &curr->elem, thread_tick_less, NULL);
-
-		thread_block();
-	}
-
-	intr_set_level (old_level);
-}
-
-void thread_wakeup (void)
-{
-	enum intr_level old_level;
-	struct list_elem *e;
-	struct int64_t *curr_sleep_ticks;
-	
-	old_level = intr_disable ();
-	curr_sleep_ticks = timer_elapsed(thread_current()->sleep_ticks);
-
-	for (e = list_begin (&sleep_list); e != list_end (&sleep_list);)
-	{
-		struct thread *iter;
-		
-		iter = list_entry (e, struct thread, elem);
-
-		if (timer_elapsed(iter->sleep_ticks) > curr_sleep_ticks)
-		{
-			break;
-		}
-		
-		ASSERT (iter->status == THREAD_BLOCKED);
-		
-		e = list_remove (e);
-		thread_unblock (iter);
-	}
-	
-	intr_set_level (old_level);
-}
-
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void
 thread_set_priority (int new_priority) {
-	thread_current ()->priority = new_priority;
+	struct thread *curr = thread_current ();
+	curr->priority = new_priority;
+
+	// main에서 특정 test_case가 바로 이 함수를 호출하는 경우가 있어 아래 예외 처리를 진행한다.
+	if (list_empty(&ready_list))
+	{
+		return;
+	}
+
+	// 현재 스레드의 우선순위가 변경된 경우, ready_list 최전방 스레드의 우선순위를 다시 비교해야 한다.
+	struct thread *next = list_entry(list_front (&ready_list), struct thread, elem);
+
+	if (next->priority > curr->priority)
+	{
+		// 다음 스레드의 우선순위가 더 높다면 현재 스레드가 실행을 양보한다.
+		thread_yield ();
+	}
 }
 
 /* Returns the current thread's priority. */
@@ -486,6 +447,7 @@ init_thread (struct thread *t, const char *name, int priority) {
 	strlcpy (t->name, name, sizeof t->name);
 	t->tf.rsp = (uint64_t) t + PGSIZE - sizeof (void *);
 	t->priority = priority;
+	t->origin_priority = priority;
 	t->magic = THREAD_MAGIC;
 }
 
@@ -665,4 +627,84 @@ allocate_tid (void) {
 	lock_release (&tid_lock);
 
 	return tid;
+}
+
+// Alarm Clock
+void
+thread_sleep (int start)
+{
+	enum intr_level old_level;
+	struct thread *curr;
+
+	ASSERT (!intr_context ());
+
+	old_level = intr_disable ();
+	curr = thread_current ();
+
+	if (curr != idle_thread)
+	{
+		curr->sleep_ticks = start;
+		list_insert_ordered (&sleep_list, &curr->elem, thread_tick_less, NULL);
+
+		thread_block();
+	}
+
+	intr_set_level (old_level);
+}
+
+void
+thread_wakeup (void)
+{
+	enum intr_level old_level;
+	struct list_elem *e;
+	struct int64_t *curr_sleep_ticks;
+	
+	old_level = intr_disable ();
+	curr_sleep_ticks = timer_elapsed(thread_current()->sleep_ticks);
+
+	for (e = list_begin (&sleep_list); e != list_end (&sleep_list);)
+	{
+		struct thread *iter;
+		
+		iter = list_entry (e, struct thread, elem);
+
+		if (timer_elapsed(iter->sleep_ticks) > curr_sleep_ticks)
+		{
+			break;
+		}
+		
+		ASSERT (iter->status == THREAD_BLOCKED);
+		
+		e = list_remove (e);
+		thread_unblock (iter);
+	}
+	
+	intr_set_level (old_level);
+}
+
+/* Returns true if value A is greater than value B, 
+   false otherwise. */
+bool
+thread_compare_priority_greater (const struct list_elem *a_, const struct list_elem *b_, void *aux UNUSED) 
+{
+  const struct thread *a = list_entry (a_, struct thread, elem);
+  const struct thread *b = list_entry (b_, struct thread, elem);
+  
+  return a->priority > b->priority;
+}
+
+// Priority Scheduling
+void thread_priority_donate(struct thread *src, struct thread *dest)
+{
+	// 현재(src) 스레드가 비교(dest) 스레드보다 우선순위가 높다면 기부한다.
+	if (src->priority > dest->priority)
+	{
+		// dest의 priority는 이미 origin_priority에 저장되어 있는 것을 유의한다.
+		dest->priority = src->priority;
+	}
+}
+
+void thread_priority_rollback (struct thread *target)
+{
+	target->priority = target->origin_priority;
 }

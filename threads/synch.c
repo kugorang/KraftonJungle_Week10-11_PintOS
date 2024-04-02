@@ -66,7 +66,7 @@ sema_down (struct semaphore *sema) {
 
 	old_level = intr_disable ();
 	while (sema->value == 0) {
-		list_push_back (&sema->waiters, &thread_current ()->elem);
+		list_insert_ordered (&sema->waiters, &thread_current ()->elem, thread_compare_priority_greater, NULL);
 		thread_block ();
 	}
 	sema->value--;
@@ -188,6 +188,15 @@ lock_acquire (struct lock *lock) {
 	ASSERT (!intr_context ());
 	ASSERT (!lock_held_by_current_thread (lock));
 
+	struct thread *curr = thread_current();
+
+	// lock의 holder가 있다는 것은 누가 이미 lock을 쥐고 있다는 뜻이다.
+	if (lock->holder != NULL)
+	{
+		// 그럴 경우 현재 스레드와 lock의 holder의 우선순위를 비교한다.
+		thread_priority_donate(curr, lock->holder);
+	}
+
 	sema_down (&lock->semaphore);
 	lock->holder = thread_current ();
 }
@@ -224,6 +233,12 @@ lock_release (struct lock *lock) {
 
 	lock->holder = NULL;
 	sema_up (&lock->semaphore);
+
+	// lock을 해제하면, 내 스레드의 우선순위를 원래대로 복원한다.
+	thread_priority_rollback(thread_current ());
+
+	// lock 해제 후, lock을 얻기 위해 대기하고 있는 스레드를 위해 yield를 실행한다.
+	thread_yield ();
 }
 
 /* Returns true if the current thread holds LOCK, false
